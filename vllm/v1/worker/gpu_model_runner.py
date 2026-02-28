@@ -3624,16 +3624,21 @@ class GPUModelRunner(
                 hidden_states = model_output
                 aux_hidden_states = None
 
+            # With PP > 1, gather captured routing data from all ranks
+            # onto the last rank via NCCL before any rank returns early.
+            # This is a collective: every PP rank must participate.
+            if (
+                self.model_config.enable_return_routed_experts
+                and get_pp_group().world_size > 1
+            ):
+                capturer = RoutedExpertsCapturer.get_instance()
+                if capturer is not None:
+                    capturer.gather_pp_captured_experts(
+                        num_tokens=num_tokens_unpadded)
+
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
-                    # Save captured routing decisions before the early return
-                    # so they are not lost for non-last PP ranks.
-                    if self.model_config.enable_return_routed_experts:
-                        capturer = RoutedExpertsCapturer.get_instance()
-                        if capturer is not None:
-                            capturer.save_captured_experts(indices=self.slot_mapping)
-
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
                     hidden_states.kv_connector_output = kv_connector_output

@@ -195,6 +195,37 @@ class RoutedExpertsCapturer:
         if self._device_buffer is not None:
             self._device_buffer.zero_()
 
+    def gather_pp_captured_experts(self, num_tokens: int) -> None:
+        """Gather captured routing data from all PP ranks onto the last rank.
+
+        With multi-node PP, each rank's shared memory is node-local and
+        invisible to the scheduler on the last rank's node.  This method
+        uses the PP communication group to forward every non-last rank's
+        device buffer to the last rank, which merges them via addition
+        (safe because each rank's buffer is zero for layers it doesn't own).
+
+        After this call the last rank's ``_device_buffer`` contains routing
+        data for *all* pipeline stages.  A no-op when PP <= 1.
+        """
+        from vllm.distributed.parallel_state import get_pp_group
+
+        pp = get_pp_group()
+        if pp.world_size <= 1:
+            return
+        if self._device_buffer is None:
+            raise RuntimeError("Buffer not initialized.")
+
+        payload = self._device_buffer[:num_tokens, :, :].contiguous()
+
+        if not pp.is_last_rank:
+            pp.send(payload, dst=pp.world_size - 1)
+        else:
+            for src in range(pp.world_size - 1):
+                remote = pp.recv(
+                    payload.shape, dtype=payload.dtype, src=src,
+                )
+                self._device_buffer[:num_tokens, :, :] += remote
+
     def save_captured_experts(self, indices: np.ndarray) -> None:
         """
         Save captured experts from device buffer to shared memory.
@@ -220,9 +251,8 @@ class RoutedExpertsCapturer:
         with _file_lock(self._lock_file):
             if self._owned_layers is not None:
                 for layer_idx in sorted(self._owned_layers):
-                    self._host_buffer_view[indices, layer_idx, :] = data[
-                        :, layer_idx, :
-                    ]
+                    self._host_buffer_view[indices, layer_idx, :] = \
+                        data[:, layer_idx, :]
             else:
                 self._host_buffer_view[indices, :, :] = data
 
