@@ -168,7 +168,7 @@ for backend in "${BACKEND_LIST[@]}"; do
             source "${SCRIPT_DIR}/setup_vllm_env.sh" "${SETUP_ARGS[@]}"
             run_one "With CPU offloading (mooncake)" "mooncake.json" \
                 --kv-transfer-config "{\"kv_connector\":\"MooncakeStoreConnector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"load_async\":true}}"
-            ;;  
+            ;;
         mooncake-mem)
             export VLLM_USE_SIMPLE_KV_OFFLOAD=0
             SETUP_ARGS=(--cpu-mem-size "$CPU_OFFLOAD_GIB")
