@@ -4461,9 +4461,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts_dict=routed_experts_dict,
-                routing_replay_added_block_hashes=(
-                    routing_replay_added_block_hashes
-                ),
+                routing_replay_added_block_hashes=(routing_replay_added_block_hashes),
                 routing_replay_removed_block_hashes=(
                     routing_replay_removed_block_hashes
                 ),

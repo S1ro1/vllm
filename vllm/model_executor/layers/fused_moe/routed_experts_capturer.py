@@ -379,6 +379,7 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         self._pending_total_tokens: int = 0
         self._added_routing_replay_block_hashes: list[bytes] = []
         self._removed_routing_replay_block_hashes: list[bytes] = []
+        self.block_cache: _RoutedExpertsBlockCache | None
 
         if not skip_host_cache:
             max_blocks = 1

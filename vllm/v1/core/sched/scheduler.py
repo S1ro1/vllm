@@ -402,9 +402,7 @@ class Scheduler(SchedulerInterface):
         )
         final_num_computed_tokens = min(initial_num_computed_tokens, replay_tokens)
         alignment = self._routing_replay_block_alignment
-        final_num_computed_tokens = (
-            final_num_computed_tokens // alignment * alignment
-        )
+        final_num_computed_tokens = final_num_computed_tokens // alignment * alignment
 
         if final_num_computed_tokens >= initial_num_computed_tokens:
             return (
