@@ -662,7 +662,13 @@ class OutputProcessor:
             finish_reason = engine_core_output.finish_reason
             stop_reason = engine_core_output.stop_reason
             kv_transfer_params = engine_core_output.kv_transfer_params
-            routed_experts = engine_core_output.routed_experts
+            routed_experts = None
+            routed_experts_payload = engine_core_output.routed_experts
+            if routed_experts_payload is not None:
+                shape, data = routed_experts_payload
+                routed_experts = np.frombuffer(data, dtype=np.int16).copy().reshape(
+                    shape
+                )
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:
