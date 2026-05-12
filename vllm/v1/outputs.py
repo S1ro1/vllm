@@ -22,6 +22,8 @@ else:
     KVConnectorWorkerMetadata = object
     KVConnectorKVEvents = object
 
+RoutedExpertsPayload: TypeAlias = tuple[tuple[int, ...], bytes]
+
 
 class LogprobsLists(NamedTuple):
     # [num_reqs x num_generated_tokens, max_num_logprobs + 1]
@@ -198,8 +200,12 @@ class ModelRunnerOutput:
     # req_id -> num_nans_in_logits
     num_nans_in_logits: dict[str, int] | None = None
 
-    # req_id -> routed experts ndarray of shape (seq_len, num_moe_layers, top_k)
-    routed_experts_dict: dict[str, np.ndarray] | None = None
+    # req_id -> routed experts encoded as (shape, raw int16 bytes).
+    routed_experts_dict: dict[str, RoutedExpertsPayload] | None = None
+
+    # Block-hash deltas for routed-expert replay data cached by the model runner.
+    routing_replay_added_block_hashes: list[bytes] = field(default_factory=list)
+    routing_replay_removed_block_hashes: list[bytes] = field(default_factory=list)
 
     # information related to cudagraph execution
     cudagraph_stats: CUDAGraphStat | None = None

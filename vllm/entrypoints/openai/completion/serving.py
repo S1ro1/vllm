@@ -7,6 +7,8 @@ from collections.abc import AsyncGenerator, AsyncIterator
 from collections.abc import Sequence as GenericSequence
 from typing import TYPE_CHECKING, cast
 
+import numpy as np
+import pybase64 as base64
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
@@ -18,6 +20,7 @@ from vllm.entrypoints.openai.completion.protocol import (
     CompletionResponseChoice,
     CompletionResponseStreamChoice,
     CompletionStreamResponse,
+    RoutedExpertsBytes,
 )
 from vllm.entrypoints.openai.engine.protocol import (
     ErrorResponse,
@@ -46,6 +49,22 @@ if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
+
+
+def _serialize_routed_experts(
+    routed_experts: np.ndarray | None,
+) -> RoutedExpertsBytes | None:
+    if routed_experts is None:
+        return None
+    data = (
+        routed_experts.data
+        if routed_experts.flags.c_contiguous
+        else routed_experts.tobytes()
+    )
+    return RoutedExpertsBytes(
+        shape=list(routed_experts.shape),
+        data=base64.b64encode(data).decode("ascii"),
+    )
 
 
 class OpenAIServingCompletion(OpenAIServing):
@@ -551,11 +570,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     token_ids=(
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),
-                    routed_experts=(
-                        output.routed_experts.tolist()
-                        if output.routed_experts is not None
-                        else None
-                    ),
+                    routed_experts=_serialize_routed_experts(output.routed_experts),
                 )
                 choices.append(choice_data)
 
@@ -584,7 +599,9 @@ class OpenAIServingCompletion(OpenAIServing):
             kv_transfer_params = final_res_batch[0].kv_transfer_params
             pre = final_res_batch[0].prompt_routed_experts
             if pre is not None:
-                prompt_routed_experts = pre.tolist()
+                prompt_routed_experts = _serialize_routed_experts(
+                    pre,
+                )
 
         return CompletionResponse(
             id=request_id,

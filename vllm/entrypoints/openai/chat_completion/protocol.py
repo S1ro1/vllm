@@ -81,6 +81,16 @@ class ChatCompletionLogProbs(OpenAIBaseModel):
     content: list[ChatCompletionLogProbsContent] | None = None
 
 
+class RoutedExpertsBytes(OpenAIBaseModel):
+    encoding: Literal["base64"] = "base64"
+    dtype: Literal["int16"] = "int16"
+    shape: list[int]
+    data: str
+
+
+RoutedExpertsResponsePayload = RoutedExpertsBytes
+
+
 class ChatCompletionResponseChoice(OpenAIBaseModel):
     index: int
     message: ChatMessage
@@ -92,16 +102,14 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     # not part of the OpenAI spec but is useful for tracing the tokens
     # in agent scenarios
     token_ids: list[int] | None = None
-    routed_experts: list[list[list[int]]] | None = None  # [gen_len, num_layers, top_k]
+    routed_experts: RoutedExpertsResponsePayload | None = None
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
     id: str = Field(default_factory=lambda: f"chatcmpl-{random_uuid()}")
     object: Literal["chat.completion"] = "chat.completion"
     created: int = Field(default_factory=lambda: int(time.time()))
-    prompt_routed_experts: list[list[list[int]]] | None = (
-        None  # [prompt_len, num_layers, top_k]
-    )
+    prompt_routed_experts: RoutedExpertsResponsePayload | None = None
     model: str
     choices: list[ChatCompletionResponseChoice]
     service_tier: Literal["auto", "default", "flex", "scale", "priority"] | None = None
