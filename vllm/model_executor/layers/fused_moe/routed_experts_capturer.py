@@ -402,10 +402,6 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 dtype=_RoutedExpertsDeviceCache.DTYPE,
                 pin_memory=True,
             )
-            # Private device snapshot: source for the async D2H. Decouples
-            # the in-flight copy from device_cache.buffer, which the next
-            # step's MoE writes overwrite in place on main_stream.
-            self._device_staging = torch.empty_like(self.device_cache.buffer)
             self._copy_stream = torch.cuda.Stream(device=device)
             self._copy_event = torch.cuda.Event()
 
@@ -420,7 +416,6 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         else:
             self.block_cache = None
             self._pinned_staging = None
-            self._device_staging = None
             self._copy_stream = None
             self._copy_event = None
             logger.info(
@@ -457,25 +452,19 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         if total_tokens == 0:
             return
 
-        # 2. Snapshot the device buffer on main_stream into a private
-        #    staging buffer, then issue the D2H from the staging buffer
-        #    on a dedicated copy stream. The snapshot serializes after
-        #    the current step's MoE writes (same stream) and is private
-        #    from the next step's MoE writes, so the in-flight D2H is
-        #    not aliased by step N+1's forward under async scheduling.
+        # 2. Issue the D2H on a dedicated copy stream after the current
+        #    step's MoE writes. The next execute_model() call finalizes
+        #    this copy before the device capture buffer can be reused.
         main_stream = torch.cuda.current_stream(self._copy_stream.device)
-        self._device_staging[:, :total_tokens, :].copy_(
-            self.device_cache.buffer[:, :total_tokens, :], non_blocking=True
-        )
         with torch.cuda.stream(self._copy_stream):
             self._copy_stream.wait_stream(main_stream)
             self._pinned_staging[:, :total_tokens, :].copy_(
-                self._device_staging[:, :total_tokens, :], non_blocking=True
+                self.device_cache.buffer[:, :total_tokens, :], non_blocking=True
             )
             self._copy_event.record()
 
         # 3. Save metadata for deferred scatter.
-        self._pending_positions = positions.numpy().copy()
+        self._pending_positions = positions.numpy()
         self._pending_num_scheduled = num_scheduled_tokens
         self._pending_block_hashes = block_hashes
         self._pending_block_size = block_size or self.block_size
@@ -566,14 +555,25 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         if not block_hashes:
             return
 
-        # A block can become hashable one scheduler step after its routing
-        # rows are filled when the block is completed by a sampled token.
-        first_block = max(int(positions.min()) // block_size - 1, 0)
-        last_block = min(int(positions.max()) // block_size + 1, len(block_hashes))
+        if positions.size == 1:
+            pos_min = pos_max = int(positions[0])
+        else:
+            pos_min = int(positions.min())
+            pos_max = int(positions.max())
+
+        # A block can become publishable when this step fills its final row,
+        # or one scheduler step later when its block hash becomes available.
+        first_block = max(pos_min // block_size - 1, 0)
+        last_block = min(pos_max // block_size + 1, len(block_hashes))
         for block_idx in range(first_block, last_block):
             start = block_idx * block_size
             end = start + block_size
+            if not (pos_min <= end - 1 <= pos_max or pos_min <= end <= pos_max):
+                continue
             if end > buf.shape[0]:
+                continue
+            block_hash = bytes(block_hashes[block_idx])
+            if self.block_cache.get(block_hash) is not None:
                 continue
             block = buf[start:end]
             if block.shape[0] != block_size or np.any(block < 0) or not np.any(block):
@@ -583,7 +583,6 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
                 sorted_rows = np.sort(rows, axis=-1)
                 if np.any(np.diff(sorted_rows, axis=-1) == 0):
                     continue
-            block_hash = bytes(block_hashes[block_idx])
             evicted_hashes = self.block_cache.put(block_hash, block)
             self._added_routing_replay_block_hashes.append(block_hash)
             self._removed_routing_replay_block_hashes.extend(evicted_hashes)
@@ -895,6 +894,7 @@ def issue_routing_d2h_copy(
         if req_id in num_scheduled_tokens
     }
     n = sum(ordered.values())
+    capturer.finalize_pending_copy()
     positions_cpu[:n].copy_(positions[:n])
     block_hashes = None
     if requests is not None:
