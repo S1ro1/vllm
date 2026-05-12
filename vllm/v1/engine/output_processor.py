@@ -666,9 +666,7 @@ class OutputProcessor:
             routed_experts_payload = engine_core_output.routed_experts
             if routed_experts_payload is not None:
                 shape, data = routed_experts_payload
-                routed_experts = np.frombuffer(data, dtype=np.int16).copy().reshape(
-                    shape
-                )
+                routed_experts = np.frombuffer(data, dtype=np.int16).reshape(shape)
 
             if req_state.is_prefilling:
                 if engine_core_output.prefill_stats is not None:

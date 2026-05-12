@@ -50,6 +50,7 @@ def _capture_routing_op_fake(
 
 
 _MB = 1024 * 1024
+_INITIAL_HOST_CACHE_TOKENS = 1024
 
 
 class _RoutedExpertsDeviceCache:
@@ -127,6 +128,9 @@ class _RoutedExpertsHostCache:
         required_len = max_pos + 1
 
         if req_id not in self._req_buffers:
+            required_len = min(
+                max(required_len, _INITIAL_HOST_CACHE_TOKENS), self.max_model_len
+            )
             buf = np.full(
                 (required_len, self.num_hidden_layers, self.num_experts_per_tok),
                 -1,
@@ -825,8 +829,9 @@ def extract_routed_experts_for_current_batch(
         seqlen = host_cache.get_filled_len(req_id)
         if seqlen <= 0:
             continue
-        experts = capturer.get_routed_experts(req_id, seqlen=seqlen, free_slot=False)
-        if experts is not None:
+        buf = host_cache.get_buffer(req_id)
+        if buf is not None:
+            experts = buf[:seqlen]
             result[req_id] = (experts.shape, experts.tobytes())
 
     return result if result else None
