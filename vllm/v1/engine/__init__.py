@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import msgspec
-import numpy as np
 import torch
 
 from vllm.lora.request import LoRARequest
@@ -16,7 +15,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.metrics.stats import PrefillStats, SchedulerStats
-from vllm.v1.outputs import LogprobsLists, LogprobsTensors
+from vllm.v1.outputs import LogprobsLists, LogprobsTensors, RoutedExpertsPayload
 from vllm.v1.serial_utils import UtilityResult
 
 # Type for pause_generation mode parameter.
@@ -187,7 +186,7 @@ class EngineCoreOutput(
 
     prefill_stats: PrefillStats | None = None
 
-    routed_experts: np.ndarray | None = None
+    routed_experts: RoutedExpertsPayload | None = None
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
