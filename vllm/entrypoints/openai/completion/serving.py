@@ -51,24 +51,11 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
-def _get_routed_experts_encoding(request: CompletionRequest) -> str:
-    xargs = request.vllm_xargs or {}
-    encoding = xargs.get("routed_experts_encoding", "json")
-    if encoding not in ("json", "base64"):
-        raise ValueError(
-            "vllm_xargs.routed_experts_encoding must be 'json' or 'base64'"
-        )
-    return str(encoding)
-
-
 def _serialize_routed_experts(
     routed_experts: np.ndarray | None,
-    encoding: str,
-) -> list[list[list[int]]] | RoutedExpertsBytes | None:
+) -> RoutedExpertsBytes | None:
     if routed_experts is None:
         return None
-    if encoding == "json":
-        return routed_experts.tolist()
     data = (
         routed_experts.data
         if routed_experts.flags.c_contiguous
@@ -517,7 +504,6 @@ class OpenAIServingCompletion(OpenAIServing):
         num_generated_tokens = 0
         kv_transfer_params = None
         last_final_res = None
-        routed_experts_encoding = _get_routed_experts_encoding(request)
         for final_res in final_res_batch:
             last_final_res = final_res
             prompt_token_ids = final_res.prompt_token_ids
@@ -584,10 +570,7 @@ class OpenAIServingCompletion(OpenAIServing):
                     token_ids=(
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),
-                    routed_experts=_serialize_routed_experts(
-                        output.routed_experts,
-                        routed_experts_encoding,
-                    ),
+                    routed_experts=_serialize_routed_experts(output.routed_experts),
                 )
                 choices.append(choice_data)
 
@@ -618,7 +601,6 @@ class OpenAIServingCompletion(OpenAIServing):
             if pre is not None:
                 prompt_routed_experts = _serialize_routed_experts(
                     pre,
-                    routed_experts_encoding,
                 )
 
         return CompletionResponse(
