@@ -459,7 +459,7 @@ class RoutedExpertsBytes(OpenAIBaseModel):
     data: str
 
 
-RoutedExpertsResponsePayload = list[list[list[int]]] | RoutedExpertsBytes
+RoutedExpertsResponsePayload = RoutedExpertsBytes
 
 
 class CompletionResponseChoice(OpenAIBaseModel):
