@@ -9,6 +9,8 @@ from collections.abc import Sequence as GenericSequence
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any, Final
 
+import numpy as np
+import pybase64 as base64
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
@@ -31,6 +33,7 @@ from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse,
     ChatMessage,
+    RoutedExpertsBytes,
 )
 from vllm.entrypoints.openai.chat_completion.stream_harmony import (
     TokenState,
@@ -77,6 +80,35 @@ if TYPE_CHECKING:
     from vllm.entrypoints.serve.render.serving import OpenAIServingRender
 
 logger = init_logger(__name__)
+
+
+def _get_routed_experts_encoding(request: ChatCompletionRequest) -> str:
+    xargs = request.vllm_xargs or {}
+    encoding = xargs.get("routed_experts_encoding", "json")
+    if encoding not in ("json", "base64"):
+        raise ValueError(
+            "vllm_xargs.routed_experts_encoding must be 'json' or 'base64'"
+        )
+    return str(encoding)
+
+
+def _serialize_routed_experts(
+    routed_experts: np.ndarray | None,
+    encoding: str,
+) -> list[list[list[int]]] | RoutedExpertsBytes | None:
+    if routed_experts is None:
+        return None
+    if encoding == "json":
+        return routed_experts.tolist()
+    data = (
+        routed_experts.data
+        if routed_experts.flags.c_contiguous
+        else routed_experts.tobytes()
+    )
+    return RoutedExpertsBytes(
+        shape=list(routed_experts.shape),
+        data=base64.b64encode(data).decode("ascii"),
+    )
 
 
 class OpenAIServingChat(OpenAIServing):
@@ -1033,6 +1065,7 @@ class OpenAIServingChat(OpenAIServing):
         else:
             history_tool_call_cnt = 0
 
+        routed_experts_encoding = _get_routed_experts_encoding(request)
         role = self.get_chat_request_role(request)
         for output in final_res.outputs:
             # check for error finish reason and raise GenerationError
@@ -1101,10 +1134,8 @@ class OpenAIServingChat(OpenAIServing):
                     token_ids=(
                         as_list(output.token_ids) if request.return_token_ids else None
                     ),
-                    routed_experts=(
-                        output.routed_experts.tolist()
-                        if output.routed_experts is not None
-                        else None
+                    routed_experts=_serialize_routed_experts(
+                        output.routed_experts, routed_experts_encoding
                     ),
                 )
                 choices.append(choice_data)
@@ -1327,10 +1358,8 @@ class OpenAIServingChat(OpenAIServing):
                 token_ids=(
                     as_list(output.token_ids) if request.return_token_ids else None
                 ),
-                routed_experts=(
-                    output.routed_experts.tolist()
-                    if output.routed_experts is not None
-                    else None
+                routed_experts=_serialize_routed_experts(
+                    output.routed_experts, routed_experts_encoding
                 ),
             )
             choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
@@ -1373,7 +1402,10 @@ class OpenAIServingChat(OpenAIServing):
 
         prompt_routed_experts = None
         if final_res.prompt_routed_experts is not None:
-            prompt_routed_experts = final_res.prompt_routed_experts.tolist()
+            prompt_routed_experts = _serialize_routed_experts(
+                final_res.prompt_routed_experts,
+                routed_experts_encoding,
+            )
 
         # ``final_res.prompt`` is the rendered chat-templated prompt text
         prompt_text = final_res.prompt if request.return_prompt_text else None
