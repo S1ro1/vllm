@@ -7,8 +7,6 @@ from collections.abc import Iterable
 from dataclasses import replace
 from typing import Any
 
-import numpy as np
-
 from vllm import envs
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import VllmConfig
@@ -278,9 +276,6 @@ class Scheduler(SchedulerInterface):
             # so update_from_output can read slot data even if a later
             # schedule() frees the blocks (async scheduling race).
             self._re_block_ids: dict[str, list[int]] = {}
-            # Request prompt token span sourced from an external KV connector.
-            # Those tokens do not have locally captured routing decisions.
-            self._re_external_token_spans: dict[str, tuple[int, int]] = {}
 
         self._pause_state: PauseState = PauseState.UNPAUSED
 
@@ -779,16 +774,6 @@ class Scheduler(SchedulerInterface):
                             num_hits=connector_prefix_cache_hits,
                             preempted=request.num_preemptions > 0,
                         )
-
-                if (
-                    self.enable_return_routed_experts
-                    and num_external_computed_tokens > 0
-                ):
-                    external_start = num_new_local_computed_tokens
-                    self._re_external_token_spans[request_id] = (
-                        external_start,
-                        external_start + num_external_computed_tokens,
-                    )
 
                 request = request_queue.pop_request()
                 if load_kv_async:
@@ -1490,12 +1475,6 @@ class Scheduler(SchedulerInterface):
                         request.num_prompt_tokens,
                         token_start=prompt_start,
                     )
-                    routed_experts = self._set_external_routed_expert_placeholders(
-                        routed_experts,
-                        self._re_external_token_spans.pop(req_id, None),
-                        token_start=prompt_start,
-                        token_end=request.num_prompt_tokens,
-                    )
                 else:
                     if scheduled_spec_token_ids:
                         # Spec decode: accepted tokens at the START of
@@ -1882,9 +1861,6 @@ class Scheduler(SchedulerInterface):
         connector_delay_free_blocks, kv_xfer_params = self._connector_finished(request)
         self.encoder_cache_manager.free(request)
         request_id = request.request_id
-        if self.enable_return_routed_experts:
-            self._re_block_ids.pop(request_id, None)
-            self._re_external_token_spans.pop(request_id, None)
         self.finished_req_ids.add(request_id)
         if self.finished_req_ids_dict is not None:
             self.finished_req_ids_dict[request.client_index].add(request_id)
@@ -1899,29 +1875,6 @@ class Scheduler(SchedulerInterface):
         assert request.is_finished()
         self.kv_cache_manager.free(request)
         del self.requests[request.request_id]
-
-    @staticmethod
-    def _set_external_routed_expert_placeholders(
-        routed_experts: np.ndarray,
-        external_token_span: tuple[int, int] | None,
-        token_start: int,
-        token_end: int,
-    ) -> np.ndarray:
-        if external_token_span is None:
-            return routed_experts
-
-        external_start, external_end = external_token_span
-        assert 0 <= external_start < external_end <= token_end
-        placeholder_start = max(external_start, token_start)
-        placeholder_end = min(external_end, token_end)
-        if placeholder_start >= placeholder_end:
-            return routed_experts
-
-        routed_experts = routed_experts.astype(np.int32, copy=True)
-        routed_experts[
-            placeholder_start - token_start : placeholder_end - token_start
-        ] = -1
-        return routed_experts
 
     @property
     def pause_state(self) -> PauseState:
@@ -2354,10 +2307,6 @@ class Scheduler(SchedulerInterface):
 
         if not total_failed_requests:
             return set()
-
-        if self.enable_return_routed_experts:
-            for req_id in async_failed_req_ids | sync_failed_req_ids:
-                self._re_external_token_spans.pop(req_id, None)
 
         # evict invalid blocks and downstream dependent blocks from cache
         # only when not using recompute policy (where blocks will be recomputed
