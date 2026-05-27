@@ -203,6 +203,18 @@ class DPCoordinatorProc:
         # For tracking request wave progression.
         current_wave = 0
         engines_running = False
+        paused = False
+        pausing = False
+        pause_epoch: int | None = None
+        pause_waiting: set[int] = set()
+        pause_frontend_waiters: set[int] = set()
+
+        resuming = False
+        resume_epoch: int | None = None
+        resume_waiting: set[int] = set()
+        resume_frontend_waiters: set[int] = set()
+        resume_has_work = False
+        start_after_resume = False
 
         # For tracking request counts for internal load-balancing.
         stats_changed = False
@@ -345,6 +357,49 @@ class DPCoordinatorProc:
                             )
                         continue  # Skip normal engine notification processing
 
+                    if (
+                        isinstance(decoded, (list, tuple))
+                        and len(decoded) >= 2
+                        and decoded[0] == "PAUSE_DP"
+                    ):
+                        _, epoch, mode, clear_cache = decoded
+                        if paused and not pausing:
+                            publish_front.send(
+                                msgspec.msgpack.encode(("PAUSE_DONE", epoch))
+                            )
+                            continue
+
+                        pause_frontend_waiters.add(epoch)
+                        if not pausing:
+                            pausing = True
+                            paused = False
+                            pause_epoch = epoch
+                            pause_waiting = set(range(len(self.engines)))
+                            self._send_dp_pause(publish_back, epoch, mode, clear_cache)
+                        continue
+
+                    if (
+                        isinstance(decoded, (list, tuple))
+                        and len(decoded) >= 2
+                        and decoded[0] == "RESUME_DP"
+                    ):
+                        _, epoch = decoded
+                        if not paused and not pausing and not resuming:
+                            publish_front.send(
+                                msgspec.msgpack.encode(("RESUME_DONE", epoch))
+                            )
+                            continue
+
+                        resume_frontend_waiters.add(epoch)
+                        if paused and not resuming:
+                            resuming = True
+                            paused = False
+                            resume_epoch = epoch
+                            resume_waiting = set(range(len(self.engines)))
+                            resume_has_work = False
+                            self._send_dp_resume(publish_back, epoch)
+                        continue
+
                     # Wave coordination: handle new-request messages from front-end.
                     # Only process these when wave coordination is enabled
                     if self.enable_wave_coordination:
@@ -353,7 +408,9 @@ class DPCoordinatorProc:
                         # engines are paused, so that we can wake the other
                         # engines.
                         engine_to_exclude, wave = decoded
-                        if not engines_running:
+                        if paused or resuming:
+                            start_after_resume = True
+                        elif not engines_running:
                             if wave < current_wave:
                                 # If the wave number is stale, ensure the message
                                 # is handled by all the engines.
@@ -408,6 +465,51 @@ class DPCoordinatorProc:
                         stats[1] = scheduler_stats.num_running_reqs
                         stats_changed = True
 
+                    if (
+                        (epoch := outputs.dp_pause_complete) is not None
+                        and pausing
+                        and epoch == pause_epoch
+                    ):
+                        pause_waiting.discard(eng_index)
+                        if not pause_waiting and not engines_running:
+                            pausing = False
+                            paused = True
+                            pause_epoch = None
+                            for waiter in pause_frontend_waiters:
+                                publish_front.send(
+                                    msgspec.msgpack.encode(("PAUSE_DONE", waiter))
+                                )
+                            pause_frontend_waiters.clear()
+                            if resume_frontend_waiters and not resuming:
+                                resuming = True
+                                paused = False
+                                resume_epoch = next(iter(resume_frontend_waiters))
+                                resume_waiting = set(range(len(self.engines)))
+                                resume_has_work = False
+                                self._send_dp_resume(publish_back, resume_epoch)
+
+                    if outputs.dp_resume_complete is not None:
+                        epoch, has_work = outputs.dp_resume_complete
+                        if resuming and epoch == resume_epoch:
+                            resume_waiting.discard(eng_index)
+                            resume_has_work = resume_has_work or has_work
+                            if not resume_waiting:
+                                resuming = False
+                                resume_epoch = None
+                                if resume_has_work or start_after_resume:
+                                    engines_running = True
+                                    wave_state_changed = True
+                                    self._send_start_wave(
+                                        publish_back, current_wave, None
+                                    )
+                                start_after_resume = False
+                                resume_has_work = False
+                                for waiter in resume_frontend_waiters:
+                                    publish_front.send(
+                                        msgspec.msgpack.encode(("RESUME_DONE", waiter))
+                                    )
+                                resume_frontend_waiters.clear()
+
                     # Wave coordination: handle wave completion and start notifications
                     # Only process these when wave coordination is enabled
                     if self.enable_wave_coordination:
@@ -425,6 +527,26 @@ class DPCoordinatorProc:
                                 current_wave = new_wave
                                 engines_running = False
                                 wave_state_changed = True
+                                if pausing and not pause_waiting:
+                                    pausing = False
+                                    paused = True
+                                    pause_epoch = None
+                                    for waiter in pause_frontend_waiters:
+                                        publish_front.send(
+                                            msgspec.msgpack.encode(
+                                                ("PAUSE_DONE", waiter)
+                                            )
+                                        )
+                                    pause_frontend_waiters.clear()
+                                    if resume_frontend_waiters and not resuming:
+                                        resuming = True
+                                        paused = False
+                                        resume_epoch = next(
+                                            iter(resume_frontend_waiters)
+                                        )
+                                        resume_waiting = set(range(len(self.engines)))
+                                        resume_has_work = False
+                                        self._send_dp_resume(publish_back, resume_epoch)
                         elif (wave := outputs.start_wave) is not None and (
                             wave > current_wave
                             or (wave == current_wave and not engines_running)
@@ -432,15 +554,18 @@ class DPCoordinatorProc:
                             # 3. The engine received request for a non-current wave
                             # so we must ensure that other engines progress to the
                             # next wave (race condition handling).
-                            logger.debug(
-                                "Starting wave %d after notification of "
-                                "stale wave request from engine.",
-                                wave,
-                            )
-                            current_wave = wave
-                            engines_running = True
-                            wave_state_changed = True
-                            self._send_start_wave(publish_back, wave, eng_index)
+                            if paused or resuming:
+                                start_after_resume = True
+                            else:
+                                logger.debug(
+                                    "Starting wave %d after notification of "
+                                    "stale wave request from engine.",
+                                    wave,
+                                )
+                                current_wave = wave
+                                engines_running = True
+                                wave_state_changed = True
+                                self._send_start_wave(publish_back, wave, eng_index)
 
                 if wave_state_changed:
                     message = (None, current_wave, engines_running)
@@ -457,6 +582,16 @@ class DPCoordinatorProc:
         """
         wave_encoded = msgspec.msgpack.encode((wave, exclude_engine_index))
         socket.send_multipart((EngineCoreRequestType.START_DP_WAVE.value, wave_encoded))
+
+    @staticmethod
+    def _send_dp_pause(socket: zmq.Socket, epoch: int, mode: str, clear_cache: bool):
+        pause_encoded = msgspec.msgpack.encode((epoch, mode, clear_cache))
+        socket.send_multipart((EngineCoreRequestType.PAUSE_DP.value, pause_encoded))
+
+    @staticmethod
+    def _send_dp_resume(socket: zmq.Socket, epoch: int):
+        resume_encoded = msgspec.msgpack.encode(epoch)
+        socket.send_multipart((EngineCoreRequestType.RESUME_DP.value, resume_encoded))
 
     def _get_engine_counts(self, do_copy=False) -> list[list[int]]:
         """Return list of [waiting, running] count lists for each engine."""

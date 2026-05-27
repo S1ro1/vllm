@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import msgspec
-import numpy as np
 import torch
 
 from vllm.lora.request import LoRARequest
@@ -16,7 +15,7 @@ from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.metrics.stats import PrefillStats, SchedulerStats
-from vllm.v1.outputs import LogprobsLists, LogprobsTensors
+from vllm.v1.outputs import LogprobsLists, LogprobsTensors, RoutedExpertsPayload
 from vllm.v1.serial_utils import UtilityResult
 
 # Type for pause_generation mode parameter.
@@ -187,7 +186,7 @@ class EngineCoreOutput(
 
     prefill_stats: PrefillStats | None = None
 
-    routed_experts: np.ndarray | None = None
+    routed_experts: RoutedExpertsPayload | None = None
     # The number of NaNs in logits.
     # A value greater than 0 indicates that the output is corrupted.
     num_nans_in_logits: int = 0
@@ -234,6 +233,9 @@ class EngineCoreOutputs(
     # In DP case, used to signal that a request was received for an
     # "old" wave, so the next wave needs to be started in other engines.
     start_wave: int | None = None
+    # In DP case, used to acknowledge coordinator-owned pause/resume epochs.
+    dp_pause_complete: int | None = None
+    dp_resume_complete: tuple[int, bool] | None = None
 
     def __post_init__(self):
         if self.timestamp == 0.0:
@@ -254,6 +256,8 @@ class EngineCoreRequestType(enum.Enum):
     EXECUTOR_FAILED = b"\x04"
     # Sentinel to wake up input_queue.get() during shutdown.
     WAKEUP = b"\x05"
+    PAUSE_DP = b"\x06"
+    RESUME_DP = b"\x07"
 
 
 class ReconfigureDistributedRequest(msgspec.Struct):
