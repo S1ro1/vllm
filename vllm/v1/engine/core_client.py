@@ -1163,6 +1163,8 @@ class DPAsyncMPClient(AsyncMPClient):
         self.lb_engines: list[list[int]] = [[0, 0] for _ in self.core_engines]
 
         self.eep_scaling_cache: ElasticScalingCache | None = None
+        self.dp_pause_results: dict[int, asyncio.Future[None]] = {}
+        self.dp_resume_results: dict[int, asyncio.Future[None]] = {}
 
         self.first_req_sock_addr = get_open_zmq_inproc_path()
         self.first_req_send_socket = self.resources.first_req_send_socket = (
@@ -1204,77 +1206,104 @@ class DPAsyncMPClient(AsyncMPClient):
                 poller.register(first_req_rcv_socket, zmq.POLLIN)
 
                 while True:
-                    events = await poller.poll()
-                    if (
-                        not self.engines_running
-                        and len(events) == 2
-                        or (events[0][0] == first_req_rcv_socket)
-                    ):
-                        # Check if this is a regular request notification or
-                        # scale up notification
-                        buf = first_req_rcv_socket.recv(flags=zmq.NOBLOCK).result()
+                    events = dict(await poller.poll())
+                    if first_req_rcv_socket in events:
+                        while True:
+                            future = first_req_rcv_socket.recv(flags=zmq.NOBLOCK)
+                            if isinstance(future.exception(), zmq.Again):
+                                break
 
-                        decoded = msgspec.msgpack.decode(buf)
+                            decoded = msgspec.msgpack.decode(future.result())
+                            if (
+                                isinstance(decoded, (list, tuple))
+                                and len(decoded) == 2
+                                and decoded[0] == "SCALE_ELASTIC_EP"
+                            ):
+                                # Extract new engine count from the decoded message
+                                new_engine_count = decoded[1]
+                                # Update engine_ranks_managed and count_slice
+                                parallel_config = self.vllm_config.parallel_config
+                                dp_size = parallel_config.data_parallel_size
+                                dp_rank = parallel_config.data_parallel_rank
+                                assert dp_rank == 0
+                                assert dp_size == new_engine_count
+                                assert not (
+                                    parallel_config.data_parallel_hybrid_lb
+                                    or parallel_config.data_parallel_external_lb
+                                )
+                                num_ranks = dp_size
+                                self.engine_ranks_managed = list(
+                                    range(dp_rank, dp_rank + num_ranks)
+                                )
+                                if len(self.lb_engines) < new_engine_count:
+                                    self.lb_engines = self.lb_engines + [
+                                        [0, 0]
+                                        for _ in range(
+                                            new_engine_count - len(self.lb_engines)
+                                        )
+                                    ]
+                                else:
+                                    self.lb_engines = self.lb_engines[:new_engine_count]
+                                scale_msg = msgspec.msgpack.encode(
+                                    ("SCALE_ELASTIC_EP", new_engine_count)
+                                )
+                                await socket.send(scale_msg)
+                                continue
+
+                            if (
+                                isinstance(decoded, (list, tuple))
+                                and len(decoded) >= 2
+                                and decoded[0] in ("PAUSE_DP", "RESUME_DP")
+                            ):
+                                await socket.send(msgspec.msgpack.encode(decoded))
+                                continue
+
+                            # We're sending a request while the engines are
+                            # paused, so the coordinator can wake peers for the
+                            # drain wave if pause has not completed yet.
+                            assert decoded[0] == "FIRST_REQ"
+                            target_eng_index = decoded[1]
+                            self.engines_running = True
+                            msg = msgspec.msgpack.encode(
+                                (target_eng_index, self.current_wave)
+                            )
+                            await socket.send(msg)
+
+                    if socket not in events:
+                        continue
+
+                    latest_stats = None
+                    while True:
+                        future = socket.recv(flags=zmq.NOBLOCK)
+                        if isinstance(future.exception(), zmq.Again):
+                            break
+
+                        decoded = msgspec.msgpack.decode(future.result())
                         if (
                             isinstance(decoded, (list, tuple))
                             and len(decoded) == 2
-                            and decoded[0] == "SCALE_ELASTIC_EP"
+                            and decoded[0] == "PAUSE_DONE"
                         ):
-                            # Extract new engine count from the decoded message
-                            new_engine_count = decoded[1]
-                            # Update engine_ranks_managed and count_slice
-                            parallel_config = self.vllm_config.parallel_config
-                            dp_size = parallel_config.data_parallel_size
-                            dp_rank = parallel_config.data_parallel_rank
-                            assert dp_rank == 0
-                            assert dp_size == new_engine_count
-                            assert not (
-                                parallel_config.data_parallel_hybrid_lb
-                                or parallel_config.data_parallel_external_lb
-                            )
-                            num_ranks = dp_size
-                            self.engine_ranks_managed = list(
-                                range(dp_rank, dp_rank + num_ranks)
-                            )
-                            if len(self.lb_engines) < new_engine_count:
-                                self.lb_engines = self.lb_engines + [
-                                    [0, 0]
-                                    for _ in range(
-                                        new_engine_count - len(self.lb_engines)
-                                    )
-                                ]
-                            else:
-                                self.lb_engines = self.lb_engines[:new_engine_count]
-                            # Send scale up notification to coordinator
-                            scale_msg = msgspec.msgpack.encode(
-                                ("SCALE_ELASTIC_EP", new_engine_count)
-                            )
-                            await socket.send(scale_msg)
+                            future = self.dp_pause_results.pop(decoded[1], None)
+                            if future is not None and not future.done():
+                                future.set_result(None)
                             continue
+                        if (
+                            isinstance(decoded, (list, tuple))
+                            and len(decoded) == 2
+                            and decoded[0] == "RESUME_DONE"
+                        ):
+                            future = self.dp_resume_results.pop(decoded[1], None)
+                            if future is not None and not future.done():
+                                future.set_result(None)
+                            continue
+                        latest_stats = decoded
 
-                        # we're sending a request while the engines are
-                        # paused, so that it can wake the others up
-                        # (to run dummy EP loop).
-                        assert decoded[0] == "FIRST_REQ"
-                        target_eng_index = decoded[1]
-                        self.engines_running = True
-                        msg = msgspec.msgpack.encode(
-                            (target_eng_index, self.current_wave)
-                        )
-                        await socket.send(msg)
-
-                    buf = None
-                    while True:
-                        # Drain all stats events (we only care about latest).
-                        future: asyncio.Future[bytes] = socket.recv(flags=zmq.NOBLOCK)
-                        if isinstance(future.exception(), zmq.Again):
-                            break
-                        buf = future.result()
-                    if buf is None:
+                    if latest_stats is None:
                         continue
 
                     # Update local load-balancing state.
-                    counts, wave, running = msgspec.msgpack.decode(buf)
+                    counts, wave, running = latest_stats
                     self.current_wave = wave
                     self.engines_running = running
                     if counts is not None:
@@ -1309,6 +1338,30 @@ class DPAsyncMPClient(AsyncMPClient):
         await to_await
 
         self._ensure_output_queue_task()
+
+    async def pause_scheduler_async(
+        self, mode: PauseMode = "abort", clear_cache: bool = True
+    ) -> None:
+        if mode not in ("keep", "abort", "wait"):
+            raise ValueError(f"Invalid pause mode: {mode}")
+        self._ensure_stats_update_task()
+        epoch = uuid.uuid1().int >> 64
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self.dp_pause_results[epoch] = future
+        await self.first_req_send_socket.send(
+            msgspec.msgpack.encode(("PAUSE_DP", epoch, mode, clear_cache))
+        )
+        await future
+
+    async def resume_scheduler_async(self) -> None:
+        self._ensure_stats_update_task()
+        epoch = uuid.uuid1().int >> 64
+        future: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+        self.dp_resume_results[epoch] = future
+        await self.first_req_send_socket.send(
+            msgspec.msgpack.encode(("RESUME_DP", epoch))
+        )
+        await future
 
     def get_core_engine_for_request(self, request: EngineCoreRequest):
         return self.core_engine
