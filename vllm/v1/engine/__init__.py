@@ -234,6 +234,9 @@ class EngineCoreOutputs(
     # In DP case, used to signal that a request was received for an
     # "old" wave, so the next wave needs to be started in other engines.
     start_wave: int | None = None
+    # In DP case, used to acknowledge coordinator-owned pause/resume epochs.
+    dp_pause_complete: int | None = None
+    dp_resume_complete: tuple[int, bool] | None = None
 
     def __post_init__(self):
         if self.timestamp == 0.0:
@@ -254,6 +257,8 @@ class EngineCoreRequestType(enum.Enum):
     EXECUTOR_FAILED = b"\x04"
     # Sentinel to wake up input_queue.get() during shutdown.
     WAKEUP = b"\x05"
+    PAUSE_DP = b"\x06"
+    RESUME_DP = b"\x07"
 
 
 class ReconfigureDistributedRequest(msgspec.Struct):

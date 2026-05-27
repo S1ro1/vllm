@@ -1713,21 +1713,21 @@ class DPEngineCoreProc(EngineCoreProc):
 
     def add_request(self, request: Request, request_wave: int = 0):
         super().add_request(request, request_wave)
-        if self.has_coordinator and request_wave != self.current_wave:
+        if self.has_coordinator:
             if request_wave > self.current_wave:
                 self.current_wave = request_wave
-            elif (
+            if (
                 not self.engines_running
                 and self.scheduler.pause_state == PauseState.UNPAUSED
             ):
-                # Request received for an already-completed wave, notify
-                # front-end that we need to start the next one.
                 self.engines_running = True
+                # Wake peers even if the frontend FIRST_REQ notification is
+                # reordered behind this request.
                 self.output_queue.put_nowait(
                     (-1, EngineCoreOutputs(start_wave=self.current_wave))
                 )
 
-    def resume_scheduler(self):
+    def _resume_scheduler(self, start_dp_wave: bool):
         if self.pending_pause or (self.engines_running and self.ignore_start_dp_wave):
             raise RuntimeError(
                 "resume_scheduler called while pause is still in "
@@ -1751,12 +1751,33 @@ class DPEngineCoreProc(EngineCoreProc):
 
         if has_global_unfinished:
             self.engines_running = True
+        if (
+            start_dp_wave
+            and self.has_coordinator
+            and not self.engines_running
+            and self.has_work()
+        ):
+            # Wake up other DP engines.
+            self.output_queue.put_nowait(
+                (-1, EngineCoreOutputs(start_wave=self.current_wave))
+            )
 
     def barrier(self):
         """Blocking barrier on the DP process group (test-only utility)."""
         import torch.distributed as dist
 
         dist.barrier(group=self.dp_group)
+
+    def resume_scheduler(self):
+        self._resume_scheduler(start_dp_wave=True)
+
+    def _send_dp_pause_complete(self, epoch: int) -> None:
+        self.output_queue.put_nowait((-1, EngineCoreOutputs(dp_pause_complete=epoch)))
+
+    def _send_dp_resume_complete(self, epoch: int) -> None:
+        self.output_queue.put_nowait(
+            (-1, EngineCoreOutputs(dp_resume_complete=(epoch, self.has_work())))
+        )
 
     def _handle_client_request(
         self, request_type: EngineCoreRequestType, request: Any
@@ -1775,6 +1796,18 @@ class DPEngineCoreProc(EngineCoreProc):
                         new_wave,
                     )
                     self.engines_running = True
+        elif request_type == EngineCoreRequestType.PAUSE_DP:
+            epoch, mode, clear_cache = request
+            result = self.pause_scheduler(mode, clear_cache)
+            if result is None:
+                self._send_dp_pause_complete(epoch)
+            else:
+                result.add_done_callback(
+                    lambda _future, epoch=epoch: self._send_dp_pause_complete(epoch)
+                )
+        elif request_type == EngineCoreRequestType.RESUME_DP:
+            self._resume_scheduler(start_dp_wave=False)
+            self._send_dp_resume_complete(request)
         else:
             super()._handle_client_request(request_type, request)
 
