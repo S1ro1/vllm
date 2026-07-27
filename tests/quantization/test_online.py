@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Tests online quantization."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -21,6 +23,41 @@ from vllm.model_executor.layers.quantization.online.nvfp4 import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.flashinfer import has_flashinfer_trtllm_fused_moe
+
+
+def test_nvfp4_per_token_backend_contract() -> None:
+    from vllm.model_executor.layers.fused_moe.experts.flashinfer_cutlass_moe import (
+        FlashInferExperts,
+    )
+    from vllm.model_executor.layers.fused_moe.experts.marlin_moe import MarlinExperts
+    from vllm.model_executor.layers.fused_moe.experts.trtllm_nvfp4_moe import (
+        TrtLlmNvFp4ExpertsModular,
+        TrtLlmNvFp4ExpertsMonolithic,
+    )
+    from vllm.model_executor.layers.fused_moe.modular_kernel import (
+        FusedMoEActivationFormat,
+    )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        kNvfp4DynamicToken,
+        kNvfp4Static,
+    )
+
+    scheme = (kNvfp4Static, kNvfp4DynamicToken)
+    assert TrtLlmNvFp4ExpertsMonolithic._supports_quant_scheme(*scheme)
+    assert not TrtLlmNvFp4ExpertsModular._supports_quant_scheme(*scheme)
+    assert not FlashInferExperts._supports_quant_scheme(*scheme)
+    assert MarlinExperts._supports_quant_scheme(*scheme)
+
+    supported, reason = TrtLlmNvFp4ExpertsMonolithic.is_supported_config(
+        TrtLlmNvFp4ExpertsMonolithic,
+        SimpleNamespace(is_act_and_mul=False),
+        *scheme,
+        FusedMoEActivationFormat.Standard,
+    )
+    assert not supported
+    assert reason == (
+        "kernel does not support per-token NVFP4 activation scaling for non-gated MoE"
+    )
 
 
 @pytest.mark.skipif(
