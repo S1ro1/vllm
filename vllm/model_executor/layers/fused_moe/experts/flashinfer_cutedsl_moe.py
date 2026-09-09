@@ -241,8 +241,11 @@ class FlashInferCuteDSLExperts(mk.FusedMoEExpertsModular):
             }
         swiglu_kwargs = {k: v for k, v in swiglu_params.items() if v is not None}
 
+        # Atomic BF16 finalize makes repeated per-token forwards diverge.
         per_token_kwargs = (
-            {"per_token_scale": per_token_scale} if self.per_token_activation else {}
+            {"per_token_scale": per_token_scale, "use_fused_finalize": False}
+            if self.per_token_activation
+            else {}
         )
         flashinfer_cute_dsl_fused_moe_nvfp4(
             x=hidden_states,
