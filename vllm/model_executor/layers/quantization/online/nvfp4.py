@@ -192,6 +192,13 @@ class Nvfp4OnlineMoEMethod(OnlineMoEMethodBase):
                 per_token_activation=True,
             )
 
+        else:
+            # Reload creates new scale tensors; derived kernel scales must use
+            # their new values before layerwise reload restores captured storage.
+            assert self.moe_quant_config is not None
+            self.moe_quant_config.g1_alphas.copy_(w13_scale_2)
+            self.moe_quant_config.g2_alphas.copy_(w2_scale_2)
+
         self.moe_kernel.fused_experts.process_weights_after_loading(layer)
 
     def get_fused_moe_quant_config(self, layer: torch.nn.Module) -> FusedMoEQuantConfig:
