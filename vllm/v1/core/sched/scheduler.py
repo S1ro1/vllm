@@ -1488,6 +1488,7 @@ class Scheduler(SchedulerInterface):
         self._inflight_prefills.discard(request)
         request.status = RequestStatus.PREEMPTED
         request.num_computed_tokens = 0
+        request.full_prompt_kv_import_len = 0
         if request.spec_token_ids:
             request.spec_token_ids = []
         # Async scheduling: mark all in-flight output as stale. Its tokens are
@@ -2939,6 +2940,7 @@ class Scheduler(SchedulerInterface):
         """
         assert self.connector is not None
 
+        request.full_prompt_kv_import_len = 0
         if request.request_id in self.failed_recving_kv_req_ids:
             # Request had KV load failures; num_computed_tokens was already
             # updated in _update_requests_with_invalid_blocks
@@ -2968,6 +2970,11 @@ class Scheduler(SchedulerInterface):
             # on a full prompt hit, we need to re-compute the last token
             # in order to be able to sample the next token
             if request.num_computed_tokens == request.num_tokens:
+                if (
+                    request.num_tokens == request.num_prompt_tokens
+                    and request.num_preemptions == 0
+                ):
+                    request.full_prompt_kv_import_len = request.num_tokens
                 request.num_computed_tokens = request.num_tokens - 1
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
